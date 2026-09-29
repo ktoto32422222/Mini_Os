@@ -2,14 +2,14 @@
 """
 Сбер POS / POS-Center OS — сервер кассы (Flask) для Amvera.
 Домен: https://tel-charger7772585.amvera.io
-Оплата: QR с телефона (СберPay) + оплата по номеру телефона (баланс карты).
+Хранилище: авто-поиск writable-папки (DATA_DIR env -> папка проекта -> cwd -> /tmp),
+иначе RAM-режим. Резервные копии: /api/backup и /api/restore.
 """
-import json, os, socket, threading, time, uuid, zlib
+import json, os, socket, tempfile, threading, time, uuid, zlib
 from datetime import datetime
 from flask import Flask, request, jsonify, Response
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_FILE = os.path.join(APP_DIR, 'sberpos_data.json')
 KEY = b'Sb3rP0sK3y2024!!'
 IV  = b'IvSb3rP0s2024!!!'
 PROMOS = {'VESNA2026': 15, 'SBER10': 10, 'SALE5': 5}
@@ -19,6 +19,28 @@ LOCK = threading.Lock()
 
 _env_srv = os.environ.get('SERVER_URL', '').strip()
 SRV = _env_srv if _env_srv.startswith('http') else 'https://tel-charger7772585.amvera.io'
+
+# ================= ВЫБОР ПАПКИ ДЛЯ ДАННЫХ (Amvera: FS может быть read-only) =================
+def _pick_data_dir():
+    cands = []
+    env = os.environ.get('DATA_DIR', '').strip()
+    if env: cands.append(env)
+    cands += [APP_DIR, os.getcwd(), '/tmp', tempfile.gettempdir()]
+    for d in cands:
+        if not d: continue
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, '.sber_write_test')
+            with open(probe, 'w', encoding='utf-8') as f: f.write('1')
+            os.remove(probe)
+            return d
+        except Exception:
+            continue
+    return None
+
+DATA_DIR = _pick_data_dir()
+DATA_FILE = os.path.join(DATA_DIR, 'sberpos_data.json') if DATA_DIR else None
+STORAGE_MODE = 'file' if DATA_FILE else 'ram'
 
 # ================= PURE-PYTHON AES-128-CBC =================
 SBOX = [0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16]
@@ -86,19 +108,22 @@ def default_data():
 
 def load():
     d = None
-    if os.path.exists(DATA_FILE):
+    if DATA_FILE and os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, 'r', encoding='utf-8') as f: d = json.load(f)
         except Exception: d = None
     if not d: d = default_data()
     d.setdefault('wallets', {})
+    d.setdefault('clients', [])
     d.setdefault('stats', {}).setdefault('wallet', 0)
     return d
 DATA = load()
 
-# ============ КРАСИВОЕ СОХРАНЕНИЕ: продукты первыми, секции через пустую строку ============
+# ============ СОХРАНЕНИЕ: продукты первыми, секции через пустую строку ============
 SECTION_ORDER = ['products','clients','wallets','receipts','returns','sessions','stats','checkNo','shiftNo','settings']
 def save():
+    if not DATA_FILE:
+        return False  # RAM-режим: писать некуда, работаем без падений
     ordered = {}
     for k in SECTION_ORDER:
         if k in DATA: ordered[k] = DATA[k]
@@ -107,9 +132,14 @@ def save():
     text = json.dumps(ordered, ensure_ascii=False, indent=2)
     for k in SECTION_ORDER[1:]:
         text = text.replace('\n  "%s":' % k, '\n\n  "%s":' % k)
-    tmp = DATA_FILE + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f: f.write(text)
-    os.replace(tmp, DATA_FILE)
+    try:
+        tmp = DATA_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f: f.write(text)
+        os.replace(tmp, DATA_FILE)
+        return True
+    except Exception as e:
+        print('[save] ошибка записи: %s' % e)
+        return False
 def time_ms(): return int(time.time()*1000)
 def today_str(): return datetime.now().strftime('%Y-%m-%d')
 
@@ -181,11 +211,40 @@ def add_cors(response):
 @app.route('/')
 def index(): return Response(HTML, mimetype='text/html')
 
+@app.route('/api/health')
+def api_health():
+    return jsonify(mode=STORAGE_MODE, data_dir=DATA_DIR, data_file=DATA_FILE,
+                   writable=bool(DATA_DIR), srv=SRV,
+                   products=len(DATA['products']), clients=len(DATA['clients']),
+                   wallets=len(DATA['wallets']), receipts=len(DATA['receipts']))
+
+@app.route('/api/backup')
+def api_backup():
+    text = json.dumps(DATA, ensure_ascii=False, indent=2)
+    r = Response(text, mimetype='application/json')
+    r.headers['Content-Disposition'] = 'attachment; filename=sberpos_data.json'
+    return r
+
+@app.route('/api/restore', methods=['POST'])
+def api_restore():
+    global DATA
+    d = request.get_json(force=True, silent=True)
+    if not isinstance(d, dict) or 'products' not in d:
+        return jsonify(error='bad backup'), 400
+    with LOCK:
+        base = default_data()
+        for k in ['clients','wallets','receipts','returns','sessions','stats','settings','checkNo','shiftNo']:
+            d.setdefault(k, base[k])
+        d['stats'].setdefault('wallet', 0)
+        DATA = d
+        ok = save()
+    return jsonify(ok=True, saved=ok)
+
 @app.route('/api/state')
 def api_state():
     return jsonify(products=DATA['products'], receipts=DATA['receipts'], returns=DATA['returns'],
                    stats=DATA['stats'], checkNo=DATA['checkNo'], shiftNo=DATA['shiftNo'],
-                   settings=DATA['settings'], srv=SRV)
+                   settings=DATA['settings'], srv=SRV, storage=STORAGE_MODE)
 
 @app.route('/api/client')
 def api_client():
@@ -456,7 +515,7 @@ body{font-family:'Inter',sans-serif;user-select:none;overflow:hidden;background:
 <div id="windowsArea" class="absolute inset-0 pb-12 overflow-hidden pointer-events-none z-10">
 <div id="win-posApp" class="pos-window pointer-events-auto" style="width:92vw;height:88vh;top:2vh;left:4vw;z-index:20">
   <div class="window-header h-9 px-2 sm:px-3 flex items-center justify-between" onmousedown="windowManager.dragStart(event,'posApp')">
-    <div class="flex items-center gap-2 font-bold text-[10px] sm:text-xs"><div class="w-4 h-4 rounded bg-emerald-600 text-white flex items-center justify-center text-[10px]"><i class="fa-solid fa-cash-register"></i></div><span>Сбер POS Terminal v5.1 · Смена № <span id="shiftLbl">14</span></span></div>
+    <div class="flex items-center gap-2 font-bold text-[10px] sm:text-xs"><div class="w-4 h-4 rounded bg-emerald-600 text-white flex items-center justify-center text-[10px]"><i class="fa-solid fa-cash-register"></i></div><span>Сбер POS Terminal v5.2 · Смена № <span id="shiftLbl">14</span> · <span id="storageBadge" class="text-emerald-700"></span></span></div>
     <div class="flex gap-1"><button onclick="windowManager.minimize('posApp')" class="w-6 h-6 hover:bg-slate-200 rounded text-xs">─</button><button onclick="windowManager.toggleMaximize('posApp')" class="w-6 h-6 hover:bg-slate-200 rounded text-xs">□</button><button onclick="windowManager.close('posApp')" class="w-6 h-6 hover:bg-rose-500 hover:text-white rounded text-xs">✕</button></div>
   </div>
   <div class="flex-1 flex flex-col lg:flex-row overflow-y-auto lg:overflow-hidden bg-slate-100">
@@ -550,10 +609,19 @@ body{font-family:'Inter',sans-serif;user-select:none;overflow:hidden;background:
   <div class="window-header h-9 px-3 flex items-center justify-between"><span class="font-bold text-xs">Заметки Смены</span><button onclick="windowManager.close('notesApp')" class="w-6 h-6 hover:bg-rose-500 hover:text-white rounded text-xs">✕</button></div>
   <div class="flex-1 bg-amber-50/50 p-3 flex flex-col gap-2"><textarea id="notesArea" class="flex-1 w-full p-3 bg-white border rounded-lg text-xs font-mono-pos resize-none"></textarea><div class="flex justify-between items-center"><span class="text-[10px] text-slate-500 font-mono-pos">Локально (браузер)</span><button onclick="saveNotes()" class="px-3 py-1 bg-teal-600 text-white font-bold text-xs rounded">Сохранить</button></div></div>
 </div>
-<div id="win-settingsApp" class="pos-window pointer-events-auto minimized" style="width:92vw;max-width:500px;height:440px;top:15vh;left:4vw;z-index:25">
+<div id="win-settingsApp" class="pos-window pointer-events-auto minimized" style="width:92vw;max-width:500px;height:460px;top:12vh;left:4vw;z-index:25">
   <div class="window-header h-9 px-3 flex items-center justify-between"><span class="font-bold text-xs">Настройки POS-ОС</span><button onclick="windowManager.close('settingsApp')" class="w-6 h-6 hover:bg-rose-500 hover:text-white rounded text-xs">✕</button></div>
   <div class="flex-1 bg-slate-50 p-4 space-y-3 text-xs overflow-y-auto">
     <div class="bg-emerald-50 border border-emerald-200 rounded-lg p-2.5"><b class="text-emerald-800">📡 Адрес сервера для телефона:</b><div id="srvUrl" class="font-mono-pos text-emerald-700 break-all"></div><div class="text-[10px] text-emerald-700 mt-1">Этот адрес встроен в каждый QR оплаты</div></div>
+    <div class="bg-sky-50 border border-sky-200 rounded-lg p-2.5 space-y-2">
+      <b class="text-sky-800 text-[11px]">💾 Резервная копия данных (хостинг)</b>
+      <div class="flex gap-2">
+        <a href="/api/backup" download="sberpos_data.json" class="flex-1 text-center py-2 bg-sky-600 text-white font-bold rounded-lg text-[11px]">Скачать копию</a>
+        <label class="flex-1 text-center py-2 bg-sky-100 text-sky-800 font-bold rounded-lg text-[11px] cursor-pointer">Восстановить<input type="file" id="restoreFile" accept=".json,application/json" class="hidden" onchange="restoreBackup(this)"></label>
+      </div>
+      <div id="storageInfo" class="text-[10px] text-sky-700 font-mono-pos"></div>
+      <div class="text-[9px] text-sky-700">На хостинге файловая система временная: после редеплоя данные сбрасываются. Скачивайте копию и восстанавливайте её после каждого деплоя.</div>
+    </div>
     <div><label class="block font-bold mb-1">Торговая точка:</label><input id="cfgStoreName" class="w-full bg-white border rounded-lg p-2 font-mono-pos"></div>
     <div><label class="block font-bold mb-1">ИНН:</label><input id="cfgInn" class="w-full bg-white border rounded-lg p-2 font-mono-pos"></div>
     <div><label class="block font-bold mb-1">Кассир:</label><input id="cfgCashier" class="w-full bg-white border rounded-lg p-2 font-mono-pos"></div>
@@ -647,12 +715,24 @@ const fmt=n=>(+n||0).toLocaleString('ru-RU',{minimumFractionDigits:2,maximumFrac
 const qrUrl=(hex,size)=>'https://api.qrserver.com/v1/create-qr-code/?size='+size+'x'+size+'&ecc=L&qzone=4&data='+encodeURIComponent('sberpay://pay?code='+hex);
 async function api(p,o){const r=await fetch(p,Object.assign({headers:{'Content-Type':'application/json'}},o));return r.json();}
 async function loadState(){state=await api('/api/state');renderAll();}
-function renderAll(){updateCounts();renderKassa();renderWarehouse();renderReports();$('shiftLbl').textContent=state.shiftNo;$('srvUrl').textContent=state.srv;$('cfgStoreName').value=state.settings.storeName;$('cfgInn').value=state.settings.inn;$('cfgCashier').value=state.settings.cashier;}
+function renderAll(){updateCounts();renderKassa();renderWarehouse();renderReports();$('shiftLbl').textContent=state.shiftNo;$('srvUrl').textContent=state.srv;$('cfgStoreName').value=state.settings.storeName;$('cfgInn').value=state.settings.inn;$('cfgCashier').value=state.settings.cashier;
+$('storageBadge').textContent=(state.storage==='file'?'файл':'ОЗУ');refreshStorageInfo();}
 function prod(id){return state.products.find(p=>p.id===id);}
 function updateCounts(){const n=state.products.length;$('warehouseCount').textContent=n;$('shortcutWarehouseCount').textContent='Склад ('+n+')';$('posCatalogCount').textContent=n;$('catalogModalTitle').textContent='Каталог '+n+' товаров';}
 function hide(id){$(id).classList.add('hidden');}
 function show(id){$(id).classList.remove('hidden');}
 function toast(msg){const t=document.createElement('div');t.className='fixed bottom-14 left-1/2 -translate-x-1/2 bg-slate-900 text-white text-[10px] sm:text-xs font-mono-pos px-4 py-2.5 rounded-xl shadow-2xl z-[70] max-w-[90vw]';t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),2800);}
+async function refreshStorageInfo(){try{const h=await api('/api/health');
+$('storageInfo').textContent='Режим: '+(h.mode==='file'?('файл '+h.data_file):'ОЗУ (данные до рестарта)')+' · чеков: '+h.receipts;}catch(e){}}
+async function restoreBackup(inp){const f=inp.files&&inp.files[0];if(!f)return;
+const txt=await f.text();
+try{const obj=JSON.parse(txt);
+const res=await fetch('/api/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)});
+const j=await res.json();
+if(j.ok){toast('✓ Данные восстановлены'+(j.saved?' и записаны в файл':' (режим ОЗУ)'));await loadState();}
+else toast('Ошибка восстановления: файл не похож на резервную копию');}
+catch(e){toast('Файл не читается: '+e);}
+inp.value='';}
 function renderKassa(){const tb=$('posTableBody');tb.innerHTML='';let total=0;
 if(!cart.length)tb.innerHTML='<div class="text-center text-slate-400 py-10">Чек пуст</div>';
 cart.forEach((l,i)=>{const p=prod(l.id);const s=p.price*l.qty;total+=s;const r=document.createElement('div');r.className='grid grid-cols-12 py-2 px-2 items-center cursor-pointer '+(i===sel?'pos-table-row-selected':'hover:bg-slate-50');r.onclick=()=>{sel=i;renderKassa();};r.innerHTML='<div class="col-span-1 text-slate-500 font-bold">'+(i+1)+'</div><div class="col-span-5 truncate">'+p.name+'</div><div class="col-span-2 text-right">'+p.price.toFixed(2)+'</div><div class="col-span-2 text-center font-bold">'+l.qty+'</div><div class="col-span-2 text-right font-bold">'+s.toFixed(2)+'</div>';tb.appendChild(r);});
@@ -670,7 +750,6 @@ if(d>0&&l.qty>=p.stock){toast('Лимит остатка');return;}l.qty+=d;if(l
 function deleteLine(){if(sel>=0&&cart.length){cart.splice(sel,1);sel=Math.min(sel,cart.length-1);renderKassa();}}
 function addRandom(){const a=state.products.filter(p=>p.stock>0);if(a.length)addItem(a[Math.floor(Math.random()*a.length)].id);}
 function clearCheck(){cart=[];sel=-1;renderKassa();}
-/* ---- ОПЛАТА ---- */
 async function openPayment(){if(!cart.length){toast('Чек пуст!');return;}
 curClient=null;curPromo=null;curWrite=0;curWallet=null;
 $('clientPanel').classList.add('hidden');$('clientInfo').innerHTML='';$('bonusRow').classList.add('hidden');
@@ -709,7 +788,6 @@ async function applyPromo(){const c=($('promoInput').value||'').trim().toUpperCa
 curPromo=['VESNA2026','SBER10','SALE5'].includes(c)?c:null;
 $('promoInfo').textContent=curPromo?'✓':'✗';$('promoInfo').className='text-[10px] font-bold '+(curPromo?'text-emerald-600':'text-rose-600');
 await startSession();}
-/* ---- КОШЕЛЁК ПО НОМЕРУ ---- */
 async function loadWallet(){const digits=($('walletPhone').value||'').replace(/\D/g,'');
 if(digits.length<10){$('walletInfo').innerHTML='<span class="text-rose-600 font-bold">Введите номер (10-11 цифр)</span>';$('payWalletBtn').disabled=true;return;}
 const r=await api('/api/wallet?phone='+digits);
@@ -727,7 +805,6 @@ const res=await api('/api/wallet/pay',{method:'POST',body:JSON.stringify({sid:cu
 if(res.ok){stopPoll();closePayment();showReceipt(res.receipt);loadState();toast('✓ Оплата по номеру: списано '+fmt(res.receipt.total)+' ₽, остаток '+fmt(res.balance)+' ₽');}
 else if(res.error==='insufficient'){toast('Недостаточно средств на балансе телефона: '+fmt(res.balance)+' ₽');loadWallet();}
 else toast('Ошибка оплаты по номеру');}
-/* ---- ЧЕК ---- */
 function showReceipt(r){$('recStore').textContent=state.settings.storeName;$('recNum').textContent=r.num;$('recInn').textContent='ИНН: '+state.settings.inn+' | ККТ: 00049210492';$('recDateTime').textContent=r.dateTime;
 const list=$('recItemsList');list.innerHTML='';
 r.items.forEach(i=>{const d=document.createElement('div');d.className='flex justify-between text-[9px]';d.innerHTML='<span>'+i.name+' ('+i.qty+'x)</span><span class="font-bold">'+(i.price*i.qty).toFixed(2)+'</span>';list.appendChild(d);});
@@ -736,7 +813,6 @@ if(r.write>0)list.insertAdjacentHTML('beforeend','<div class="flex justify-betwe
 if(r.accrual>0)list.insertAdjacentHTML('beforeend','<div class="flex justify-between text-[9px] text-emerald-600 font-bold"><span>НАЧИСЛЕНО:</span><span>+'+r.accrual+' б (баланс '+r.nb+')</span></div>');
 $('recTotal').textContent=(r.total<0?'-':'')+fmt(Math.abs(r.total))+' ₽';$('recVat').textContent=fmt(r.vat)+' ₽';$('recPayType').textContent=r.payType+(r.walletPhone?' · '+r.walletPhone:'');$('recFiscal').textContent='ФД: '+r.fd+' | ФП: '+r.fp;
 $('recQrImg').src=qrUrl(r.code,300);show('receiptModal');}
-/* ---- СКЛАД ---- */
 function renderWarehouse(){const q=($('warehouseSearch').value||'').toLowerCase();const cat=$('warehouseCategoryFilter').value;
 const tb=$('warehouseTableBody');tb.innerHTML='';let tv=0;
 state.products.forEach(p=>{tv+=p.price*p.stock;if(cat!=='Все'&&p.category!==cat)return;if(q&&!p.name.toLowerCase().includes(q)&&!p.code.includes(q)&&!p.barcode.includes(q))return;
@@ -755,13 +831,11 @@ let code=$('apCode').value.trim();if(!code)code=String(Math.max.apply(null,state
 let barcode=$('apBarcode').value.trim();if(!barcode)barcode=String(Math.max.apply(null,state.products.map(p=>parseInt(p.barcode)||0))+1);
 await api('/api/product',{method:'POST',body:JSON.stringify({name:name,code:code,barcode:barcode,price:price,stock:parseInt($('apStock').value)||0,unit:$('apUnit').value,category:$('apCategory').value})});
 hide('addProductModal');loadState();toast('✓ Товар добавлен');}
-/* ---- КАТАЛОГ ---- */
 function openCatalog(){renderCatalog();show('catalogModal');}
 function renderCatalog(){const q=($('catalogModalSearch').value||'').toLowerCase();const g=$('catalogModalGrid');g.innerHTML='';
 state.products.filter(p=>p.name.toLowerCase().includes(q)||p.code.includes(q)).forEach(p=>{const c=document.createElement('div');c.className='p-2.5 bg-slate-50 border rounded-lg cursor-pointer hover:border-emerald-500';c.onclick=()=>{addItem(p.id);hide('catalogModal');};
 c.innerHTML='<div><span class="text-[9px] text-slate-400 font-mono-pos">Код: '+p.code+'</span><h5 class="font-bold text-xs">'+p.name+'</h5></div><div class="mt-2 flex justify-between text-xs font-mono-pos"><span class="text-emerald-700 font-bold">'+p.price.toFixed(2)+' ₽</span><span class="text-[10px] '+(p.stock>0?'bg-emerald-100 text-emerald-800':'bg-rose-100 text-rose-800')+' px-1.5 rounded font-semibold">'+(p.stock>0?'Ост:'+p.stock:'Нет')+'</span></div>';
 g.appendChild(c);});}
-/* ---- ОТЧЕТЫ ---- */
 function renderReports(){const s=state.stats;
 $('repTotalRevenue').textContent=fmt(s.revenue)+' ₽';$('repChecksCount').textContent=s.checks;
 $('repAvgCheck').textContent=fmt(s.checks?s.revenue/s.checks:0)+' ₽';$('repCashDrawer').textContent=fmt(s.drawer)+' ₽';
@@ -784,7 +858,6 @@ const bp={};recs.forEach(r=>r.items.forEach(i=>{bp[i.name]=(bp[i.name]||0)+i.pri
 const top=Object.keys(bp).map(k=>[k,bp[k]]).sort((a,b)=>b[1]-a[1]).slice(0,5);
 if(!top.length){c2.fillStyle='#94a3b8';c2.fillText('Нет данных',8,60);}else{const mx=top[0][1]||1;const rh=(H2-40)/top.length;
 top.forEach((p,i)=>{const y=26+i*rh;const bw=(p[1]/mx)*(W2-230);c2.fillStyle='#0284c7';c2.fillRect(190,y+3,Math.max(4,bw),rh-10);c2.fillStyle='#334155';c2.font='9px monospace';c2.fillText(p[0].substring(0,24),6,y+rh/2+2);c2.fillStyle='#0c4a6e';c2.fillText(Math.round(p[1])+'₽',194+Math.max(4,bw),y+rh/2+2);});}}
-/* ---- ВОЗВРАТЫ ---- */
 function openReturnModal(){if(!state.receipts.length){toast('Нет чеков');return;}
 const s=$('retReceipt');s.innerHTML='';state.receipts.slice(0,30).forEach(r=>{const o=document.createElement('option');o.value=r.num;o.textContent='№'+r.num+' · '+r.dateTime+' · '+fmt(r.total)+' ₽';s.appendChild(o);});
 onRetChange();show('returnModal');}
@@ -829,6 +902,7 @@ if(window.innerWidth<1024)windowManager.toggleMaximize('posApp');};
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 80))
     print('=== Сбер POS (Amvera) ===')
-    print('Домен: https://tel-charger7772585.amvera.io')
-    print('Порт:  ', port)
+    print('Домен:     https://tel-charger7772585.amvera.io')
+    print('Порт:      ', port)
+    print('Хранилище: ', STORAGE_MODE, DATA_FILE or '(только ОЗУ)')
     app.run(host='0.0.0.0', port=port, debug=False)
