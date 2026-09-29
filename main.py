@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Сбер POS / POS-Center OS — сервер кассы (Flask) для Amvera
+Сбер POS / POS-Center OS — сервер кассы (Flask) для Amvera.
 Домен: https://tel-charger7772585.amvera.io
-Запуск: python app.py (или через gunicorn)
+Оплата: QR с телефона (СберPay) + оплата по номеру телефона (баланс карты).
 """
 import json, os, socket, threading, time, uuid, zlib
 from datetime import datetime
@@ -17,12 +17,8 @@ BONUS_MAX_PERCENT = 80
 SNACK = 'Сладости и Снеки'
 LOCK = threading.Lock()
 
-# ============ АДРЕС СЕРВЕРА ДЛЯ ТЕЛЕФОНА ============
 _env_srv = os.environ.get('SERVER_URL', '').strip()
-if _env_srv.startswith('http'):
-    SRV = _env_srv
-else:
-    SRV = 'https://tel-charger7772585.amvera.io'
+SRV = _env_srv if _env_srv.startswith('http') else 'https://tel-charger7772585.amvera.io'
 
 # ================= PURE-PYTHON AES-128-CBC =================
 SBOX = [0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16]
@@ -82,23 +78,42 @@ def default_data():
             {'phone':'79991234567','name':'Иван Петров','bonus':500,'spent':6200},
             {'phone':'79161112233','name':'Мария Сидорова','bonus':120,'spent':1500},
             {'phone':'79035556677','name':'Олег Козлов','bonus':980,'spent':24000}],
+        'wallets': {},
         'receipts': [], 'returns': [], 'sessions': {},
-        'stats': {'revenue':0,'checks':0,'sberPay':0,'card':0,'cash':0,'drawer':0,'returnsSum':0},
+        'stats': {'revenue':0,'checks':0,'sberPay':0,'wallet':0,'card':0,'cash':0,'drawer':0,'returnsSum':0},
         'checkNo': 1001, 'shiftNo': 14,
         'settings': {'storeName':'ООО СБЕР МАРКЕТ #42','inn':'770123456789','cashier':'Администратор (Смена №14)'}}
+
 def load():
+    d = None
     if os.path.exists(DATA_FILE):
         try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f: return json.load(f)
-        except Exception: pass
-    return default_data()
+            with open(DATA_FILE, 'r', encoding='utf-8') as f: d = json.load(f)
+        except Exception: d = None
+    if not d: d = default_data()
+    d.setdefault('wallets', {})
+    d.setdefault('stats', {}).setdefault('wallet', 0)
+    return d
 DATA = load()
+
+# ============ КРАСИВОЕ СОХРАНЕНИЕ: продукты первыми, секции через пустую строку ============
+SECTION_ORDER = ['products','clients','wallets','receipts','returns','sessions','stats','checkNo','shiftNo','settings']
 def save():
+    ordered = {}
+    for k in SECTION_ORDER:
+        if k in DATA: ordered[k] = DATA[k]
+    for k in DATA:
+        if k not in ordered: ordered[k] = DATA[k]
+    text = json.dumps(ordered, ensure_ascii=False, indent=2)
+    for k in SECTION_ORDER[1:]:
+        text = text.replace('\n  "%s":' % k, '\n\n  "%s":' % k)
     tmp = DATA_FILE + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f: json.dump(DATA, f, ensure_ascii=False)
+    with open(tmp, 'w', encoding='utf-8') as f: f.write(text)
     os.replace(tmp, DATA_FILE)
 def time_ms(): return int(time.time()*1000)
+def today_str(): return datetime.now().strftime('%Y-%m-%d')
 
+# ================= ЛОЯЛЬНОСТЬ + КОШЕЛЁК =================
 def level_name(c):
     if c.get('level'): return str(c['level'])
     return 'Золотой' if c['spent'] >= 20000 else ('Серебряный' if c['spent'] >= 5000 else 'Новый')
@@ -121,6 +136,15 @@ def register_client(phone):
     c = {'phone': phone, 'name': 'Клиент ' + phone[-4:], 'bonus': 100, 'spent': 0}
     DATA['clients'].append(c); save()
     return c
+def ensure_wallet(phone):
+    w = DATA['wallets'].get(phone)
+    if w is None:
+        w = {'balance': 0.0, 'lastTopup': ''}
+        DATA['wallets'][phone] = w
+    if w.get('lastTopup') != today_str():
+        w['balance'] = round(w['balance'] + 10000.0, 2)
+        w['lastTopup'] = today_str()
+    return w
 def price_cart(items, client, promo, write):
     subtotal = 0.0; happy = 0.0
     hour = datetime.now().hour
@@ -144,10 +168,8 @@ def price_cart(items, client, promo, write):
                 accrual=accrual, pct=pct, level=level_name(client) if client else None)
 
 app = Flask(__name__)
-try:
-    app.json.ensure_ascii = False
-except Exception:
-    app.config['JSON_AS_ASCII'] = False
+try: app.json.ensure_ascii = False
+except Exception: app.config['JSON_AS_ASCII'] = False
 
 @app.after_request
 def add_cors(response):
@@ -173,7 +195,70 @@ def api_client():
         if not c and phone.isdigit() and len(phone) >= 10:
             c = register_client(phone); created = True
         if not c: return jsonify(found=False)
-        return jsonify(found=True, created=created, client=c, level=level_name(c), pct=level_pct(c))
+        w = ensure_wallet(phone); save()
+        return jsonify(found=True, created=created, client=c, level=level_name(c), pct=level_pct(c),
+                       wallet=w['balance'], walletTopup=w['lastTopup'])
+
+@app.route('/api/wallet')
+def api_wallet():
+    phone = request.args.get('phone', '')
+    if not (phone.isdigit() and len(phone) >= 10): return jsonify(found=False)
+    with LOCK:
+        w = ensure_wallet(phone)
+        c = find_client(phone)
+        save()
+        return jsonify(found=True, phone=phone, balance=w['balance'], lastTopup=w['lastTopup'],
+                       name=c['name'] if c else 'Карта ' + phone[-4:],
+                       bonus=c['bonus'] if c else 0,
+                       level=level_name(c) if c else 'Новый',
+                       pct=level_pct(c) if c else 5)
+
+@app.route('/api/wallet/pay', methods=['POST'])
+def wallet_pay():
+    d = request.get_json(force=True)
+    phone = (d.get('phone') or '').strip()
+    with LOCK:
+        s = DATA['sessions'].get(d.get('sid', ''))
+        if not s: return jsonify(error='no session'), 404
+        if s['status'] == 'done': return jsonify(ok=True, receipt=s['receipt'])
+        if not (phone.isdigit() and len(phone) >= 10): return jsonify(error='phone'), 400
+        w = ensure_wallet(phone)
+        pr = s['pricing']
+        if w['balance'] + 1e-9 < pr['payable']:
+            save()
+            return jsonify(error='insufficient', balance=w['balance']), 402
+        w['balance'] = round(w['balance'] - pr['payable'], 2)
+        num = str(DATA['checkNo']).zfill(5)
+        client = find_client(s['clientPhone']) or find_client(phone)
+        nb = None
+        if client:
+            client['bonus'] = client['bonus'] - pr['write'] + pr['accrual']
+            client['spent'] += pr['payable']; nb = client['bonus']
+        for it in s['items']:
+            p = next(x for x in DATA['products'] if x['id'] == it['id'])
+            p['stock'] = max(0, p['stock'] - it['qty'])
+        st = DATA['stats']
+        st['revenue'] += pr['payable']; st['checks'] += 1
+        st['wallet'] = st.get('wallet', 0) + pr['payable']
+        pay_label = 'Карта телефона'
+        dt_str = datetime.now().strftime('%d.%m.%Y %H:%M')
+        receipt = dict(num=num, ts=time_ms(), dateTime=dt_str,
+                       items=[dict(name=i['name'], qty=i['qty'], price=i['price']) for i in s['items']],
+                       subtotal=pr['subtotal'], total=pr['payable'], vat=round(pr['payable']*20/120, 2),
+                       discount=pr['discountTotal'], promo=s['promo'], write=pr['write'], accrual=pr['accrual'],
+                       clientPhone=phone, nb=nb, walletPhone=phone, payType=pay_label,
+                       fd=str(uuid.uuid4().int)[:9], fp=str(uuid.uuid4().int)[:10])
+        rp = dict(n=num, mode='view', pt=pay_label, dt=dt_str,
+                  t=int(round(pr['payable']*100)), i=[dict(m=i['name'][:14], q=i['qty']) for i in s['items']])
+        if pr['discountTotal'] > 0: rp['d'] = int(round(pr['discountTotal']*100))
+        if s['promo']: rp['pc'] = s['promo']
+        if client: rp.update(c=client['phone'], w=pr['write'], b=pr['accrual'], nb=nb, cs=client['spent'])
+        receipt['code'] = enc_payload(rp)
+        DATA['receipts'].insert(0, receipt); DATA['receipts'] = DATA['receipts'][:200]
+        DATA['checkNo'] += 1
+        s['status'] = 'done'; s['receipt'] = receipt
+        save()
+        return jsonify(ok=True, receipt=receipt, balance=w['balance'])
 
 @app.route('/api/card')
 def api_card():
@@ -183,13 +268,15 @@ def api_card():
         if not c and phone.isdigit() and len(phone) >= 10:
             c = register_client(phone)
         if not c: return jsonify(found=False)
+        w = ensure_wallet(phone); save()
         hist = []
         for r in DATA['receipts']:
             if r.get('clientPhone') == phone and r.get('accrual') is not None:
                 hist.append('Чек №%s: +%s б / −%s б' % (r['num'], r.get('accrual',0), r.get('write',0)))
             if len(hist) >= 5: break
         return jsonify(found=True, phone=c['phone'], bonus=c['bonus'], spent=c['spent'],
-                       level=level_name(c), pct=level_pct(c), hist='\n'.join(hist))
+                       level=level_name(c), pct=level_pct(c), hist='\n'.join(hist),
+                       wallet=w['balance'], walletTopup=w['lastTopup'])
 
 @app.route('/api/session/start', methods=['POST'])
 def session_start():
@@ -308,6 +395,9 @@ def api_return():
             p = next((x for x in DATA['products'] if x['name'] == it['name']), None)
             if p: p['stock'] += it['qty']
         st = DATA['stats']; st['revenue'] -= summ; st['returnsSum'] = st.get('returnsSum',0) + summ
+        wp = rec.get('walletPhone')
+        if wp and wp in DATA['wallets']:
+            DATA['wallets'][wp]['balance'] = round(DATA['wallets'][wp]['balance'] + summ, 2)
         rp = dict(n=ret['num'], mode='view', pt='ВОЗВРАТ', dt=dt_str,
                   t=-int(round(summ*100)), i=[dict(m=i['name'][:14], q=-i['qty']) for i in items])
         ret['code'] = enc_payload(rp)
@@ -317,7 +407,7 @@ def api_return():
 @app.route('/api/zreport', methods=['POST'])
 def api_z():
     with LOCK:
-        DATA['stats'] = dict(revenue=0, checks=0, sberPay=0, card=0, cash=0, drawer=0, returnsSum=0)
+        DATA['stats'] = dict(revenue=0, checks=0, sberPay=0, wallet=0, card=0, cash=0, drawer=0, returnsSum=0)
         DATA['shiftNo'] += 1; DATA['sessions'] = {}; save()
     return jsonify(ok=True, shiftNo=DATA['shiftNo'])
 
@@ -327,7 +417,7 @@ def api_settings():
         DATA['settings'].update(request.get_json(force=True)); save()
     return jsonify(ok=True)
 
-# ================= ВСТРОЕННЫЙ HTML (полный интерфейс POS-ОС) =================
+# ================= ВСТРОЕННЫЙ HTML =================
 HTML = r'''<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -366,7 +456,7 @@ body{font-family:'Inter',sans-serif;user-select:none;overflow:hidden;background:
 <div id="windowsArea" class="absolute inset-0 pb-12 overflow-hidden pointer-events-none z-10">
 <div id="win-posApp" class="pos-window pointer-events-auto" style="width:92vw;height:88vh;top:2vh;left:4vw;z-index:20">
   <div class="window-header h-9 px-2 sm:px-3 flex items-center justify-between" onmousedown="windowManager.dragStart(event,'posApp')">
-    <div class="flex items-center gap-2 font-bold text-[10px] sm:text-xs"><div class="w-4 h-4 rounded bg-emerald-600 text-white flex items-center justify-center text-[10px]"><i class="fa-solid fa-cash-register"></i></div><span>Сбер POS Terminal v5.0 · Смена № <span id="shiftLbl">14</span></span></div>
+    <div class="flex items-center gap-2 font-bold text-[10px] sm:text-xs"><div class="w-4 h-4 rounded bg-emerald-600 text-white flex items-center justify-center text-[10px]"><i class="fa-solid fa-cash-register"></i></div><span>Сбер POS Terminal v5.1 · Смена № <span id="shiftLbl">14</span></span></div>
     <div class="flex gap-1"><button onclick="windowManager.minimize('posApp')" class="w-6 h-6 hover:bg-slate-200 rounded text-xs">─</button><button onclick="windowManager.toggleMaximize('posApp')" class="w-6 h-6 hover:bg-slate-200 rounded text-xs">□</button><button onclick="windowManager.close('posApp')" class="w-6 h-6 hover:bg-rose-500 hover:text-white rounded text-xs">✕</button></div>
   </div>
   <div class="flex-1 flex flex-col lg:flex-row overflow-y-auto lg:overflow-hidden bg-slate-100">
@@ -436,9 +526,10 @@ body{font-family:'Inter',sans-serif;user-select:none;overflow:hidden;background:
       <div class="bg-white p-3 rounded-xl border"><span class="text-slate-500 text-[9px] font-bold uppercase">В ящике</span><div id="repCashDrawer" class="text-lg font-extrabold text-amber-600 font-mono-pos">0 ₽</div></div>
     </div>
     <div class="bg-white p-3 rounded-xl border space-y-2">
-      <h3 class="font-bold text-xs border-b pb-2">Оплата: только СберPay (QR)</h3>
+      <h3 class="font-bold text-xs border-b pb-2">Разбивка по способам оплаты</h3>
       <div class="font-mono-pos text-[10px] space-y-2">
-        <div><div class="flex justify-between mb-1"><span>СберPay (QR):</span><b id="repSberPayVal">0</b></div><div class="w-full bg-slate-100 h-2 rounded-full"><div id="repSberPayBar" class="bg-emerald-500 h-full w-0"></div></div></div>
+        <div><div class="flex justify-between mb-1"><span><i class="fa-solid fa-qrcode text-emerald-600 mr-1"></i>СберPay (QR с телефона):</span><b id="repSberPayVal">0</b></div><div class="w-full bg-slate-100 h-2 rounded-full"><div id="repSberPayBar" class="bg-emerald-500 h-full w-0"></div></div></div>
+        <div><div class="flex justify-between mb-1"><span><i class="fa-solid fa-mobile-screen text-pink-600 mr-1"></i>Карта телефона (по номеру):</span><b id="repWalletVal">0</b></div><div class="w-full bg-slate-100 h-2 rounded-full"><div id="repWalletBar" class="bg-pink-500 h-full w-0"></div></div></div>
       </div>
     </div>
     <div class="bg-white p-3 rounded-xl border"><h3 class="font-bold text-xs border-b pb-2 mb-2">📊 Дашборд смены</h3><canvas id="chartHours" class="w-full block mb-2" height="140"></canvas><canvas id="chartTop" class="w-full block" height="140"></canvas></div>
@@ -476,7 +567,7 @@ body{font-family:'Inter',sans-serif;user-select:none;overflow:hidden;background:
 </footer>
 <div id="paymentModal" class="hidden fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-2">
   <div class="bg-white rounded-2xl w-full max-w-xl max-h-[94vh] overflow-y-auto shadow-2xl">
-    <div class="p-3 bg-emerald-700 text-white flex justify-between items-center"><div><h3 class="font-bold text-sm">Оплата заказа · только СберPay / QR</h3><p class="text-[10px] text-emerald-100">Подтверждение — с телефона покупателя</p></div><button onclick="closePayment()" class="text-2xl font-bold">✕</button></div>
+    <div class="p-3 bg-emerald-700 text-white flex justify-between items-center"><div><h3 class="font-bold text-sm">Оплата заказа</h3><p class="text-[10px] text-emerald-100">QR — списание с телефона · по номеру — списание с баланса карты</p></div><button onclick="closePayment()" class="text-2xl font-bold">✕</button></div>
     <div class="p-3 space-y-3 bg-slate-50">
       <div class="bg-white p-3 rounded-xl border flex justify-between items-center"><span class="text-[10px] font-bold uppercase text-slate-600">Итого к оплате:</span><span id="payModalTotal" class="text-2xl font-extrabold font-mono-pos text-emerald-700">0.00 ₽</span></div>
       <div class="bg-white p-3 rounded-xl border space-y-2">
@@ -489,11 +580,17 @@ body{font-family:'Inter',sans-serif;user-select:none;overflow:hidden;background:
         <div class="flex gap-2 items-center"><input id="promoInput" placeholder="Промокод (VESNA2026)" class="flex-1 bg-white border rounded-lg px-2 py-1.5 text-[11px] font-mono-pos uppercase"><button onclick="applyPromo()" class="px-3 bg-emerald-600 text-white font-bold text-[10px] rounded-lg">Применить</button><span id="promoInfo" class="text-[10px] font-bold"></span></div>
         <div id="discountBreakdown" class="text-[10px] font-mono-pos text-slate-600 space-y-0.5"></div>
       </div>
+      <div class="bg-white p-3 rounded-xl border space-y-2">
+        <div class="flex justify-between items-center"><span class="text-[10px] font-bold uppercase text-slate-600"><i class="fa-solid fa-mobile-screen text-emerald-600 mr-1"></i>Оплата по номеру телефона</span><span class="text-[9px] text-slate-400">баланс карты + баллы</span></div>
+        <div class="flex gap-2"><input id="walletPhone" placeholder="79991234567" class="flex-1 bg-white border rounded-lg px-2 py-1.5 text-[11px] font-mono-pos"><button onclick="loadWallet()" class="px-3 bg-emerald-600 text-white font-bold text-[10px] rounded-lg">Показать</button></div>
+        <div id="walletInfo" class="text-[10px] font-mono-pos text-slate-600"></div>
+        <button id="payWalletBtn" onclick="payWallet()" disabled class="w-full py-2.5 bg-emerald-600 text-white font-bold text-[11px] rounded-lg disabled:opacity-40">Списать с баланса телефона</button>
+      </div>
       <div class="bg-white rounded-xl border flex flex-col items-center p-3 space-y-2">
         <div class="w-56 h-56 sm:w-72 sm:h-72 bg-white p-3 rounded-lg border relative flex items-center justify-center"><img id="sberQrImg" src="" class="w-full h-full" style="image-rendering:pixelated"><div id="qrSpinner" class="absolute w-10 h-10 border-4 border-emerald-200 border-t-emerald-600 rounded-full animate-spin"></div></div>
         <div id="payCodeText" class="font-mono-pos text-[8px] text-slate-500 bg-slate-100 px-2 py-1 rounded select-all break-all max-w-full max-h-10 overflow-hidden"></div>
         <div id="sberStatus" class="text-[10px] font-bold text-amber-700 pay-anim">⏳ Ожидание оплаты с телефона...</div>
-        <p class="text-[9px] text-slate-500 text-center">Кнопок подтверждения нет: оплату принимает только телефон покупателя</p>
+        <p class="text-[9px] text-slate-500 text-center">QR — оплата с телефона покупателя. Либо спишите с баланса по номеру выше.</p>
       </div>
     </div>
   </div>
@@ -544,7 +641,7 @@ body{font-family:'Inter',sans-serif;user-select:none;overflow:hidden;background:
 </div>
 <script>
 let state=null,cart=[],sel=-1,buffer='';
-let curSession=null,pollTimer=null,curClient=null,curPromo=null,curWrite=0,retCurrent=null,calcExpr='';
+let curSession=null,pollTimer=null,curClient=null,curPromo=null,curWrite=0,retCurrent=null,curWallet=null,calcExpr='';
 const $=id=>document.getElementById(id);
 const fmt=n=>(+n||0).toLocaleString('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2});
 const qrUrl=(hex,size)=>'https://api.qrserver.com/v1/create-qr-code/?size='+size+'x'+size+'&ecc=L&qzone=4&data='+encodeURIComponent('sberpay://pay?code='+hex);
@@ -573,14 +670,19 @@ if(d>0&&l.qty>=p.stock){toast('Лимит остатка');return;}l.qty+=d;if(l
 function deleteLine(){if(sel>=0&&cart.length){cart.splice(sel,1);sel=Math.min(sel,cart.length-1);renderKassa();}}
 function addRandom(){const a=state.products.filter(p=>p.stock>0);if(a.length)addItem(a[Math.floor(Math.random()*a.length)].id);}
 function clearCheck(){cart=[];sel=-1;renderKassa();}
+/* ---- ОПЛАТА ---- */
 async function openPayment(){if(!cart.length){toast('Чек пуст!');return;}
-curClient=null;curPromo=null;curWrite=0;$('clientPanel').classList.add('hidden');$('clientInfo').innerHTML='';$('bonusRow').classList.add('hidden');$('promoInput').value='';$('promoInfo').textContent='';
+curClient=null;curPromo=null;curWrite=0;curWallet=null;
+$('clientPanel').classList.add('hidden');$('clientInfo').innerHTML='';$('bonusRow').classList.add('hidden');
+$('promoInput').value='';$('promoInfo').textContent='';
+$('walletPhone').value='';$('walletInfo').innerHTML='';$('payWalletBtn').disabled=true;
 show('paymentModal');await startSession();startPoll();}
 function closePayment(){hide('paymentModal');stopPoll();curSession=null;}
 async function startSession(){const res=await api('/api/session/start',{method:'POST',body:JSON.stringify({items:cart.map(l=>({id:l.id,qty:l.qty})),clientPhone:curClient?curClient.phone:null,promo:curPromo,write:curWrite})});
 curSession=res;renderBreakdown(res.pricing);
 $('payModalTotal').textContent=fmt(res.pricing.payable)+' ₽';
-$('qrSpinner').style.display='block';const img=$('sberQrImg');img.onload=()=>$('qrSpinner').style.display='none';img.src=qrUrl(res.code,400);$('payCodeText').textContent=res.code;}
+$('qrSpinner').style.display='block';const img=$('sberQrImg');img.onload=()=>$('qrSpinner').style.display='none';img.src=qrUrl(res.code,400);$('payCodeText').textContent=res.code;
+if(($('walletPhone').value||'').replace(/\D/g,'').length>=10)loadWallet();}
 function renderBreakdown(p){let h='<div class="flex justify-between"><span>Сумма без скид:</span><span>'+fmt(p.subtotal)+' ₽</span></div>';
 if(p.happy>0)h+='<div class="flex justify-between text-pink-600"><span>🕗 Счастливые часы −20%:</span><span>−'+fmt(p.happy)+' ₽</span></div>';
 if(p.promoDisc>0)h+='<div class="flex justify-between text-pink-600"><span>🎟 Промокод '+curPromo+':</span><span>−'+fmt(p.promoDisc)+' ₽</span></div>';
@@ -598,21 +700,43 @@ async function findClient(){const digits=($('clientPhone').value||'').replace(/\
 const r=await api('/api/client?phone='+digits);
 if(!r.found){curClient=null;$('clientInfo').innerHTML='<span class="text-rose-600 font-bold">Клиент не найден</span>';$('bonusRow').classList.add('hidden');}
 else{curClient=r.client;if(r.created)toast('💚 Клиент создан: +100 приветственных бонусов');
-$('clientInfo').innerHTML='<b>'+r.client.name+'</b> · '+r.level+' · баланс: <b class="text-purple-700">'+r.client.bonus+' б</b>';$('bonusRow').classList.remove('hidden');$('bonusRow').style.display='flex';$('bonusWriteInput').value=0;curWrite=0;}
+$('clientInfo').innerHTML='<b>'+r.client.name+'</b> · '+r.level+' · баллы: <b class="text-purple-700">'+r.client.bonus+' б</b> · баланс карты: <b class="text-emerald-700">'+fmt(r.wallet)+' ₽</b>';
+$('bonusRow').classList.remove('hidden');$('bonusRow').style.display='flex';$('bonusWriteInput').value=0;curWrite=0;
+$('walletPhone').value=digits;loadWallet();}
 await startSession();}
 function onBonusInput(v){curWrite=parseInt(v)||0;startSession();}
 async function applyPromo(){const c=($('promoInput').value||'').trim().toUpperCase();
 curPromo=['VESNA2026','SBER10','SALE5'].includes(c)?c:null;
 $('promoInfo').textContent=curPromo?'✓':'✗';$('promoInfo').className='text-[10px] font-bold '+(curPromo?'text-emerald-600':'text-rose-600');
 await startSession();}
+/* ---- КОШЕЛЁК ПО НОМЕРУ ---- */
+async function loadWallet(){const digits=($('walletPhone').value||'').replace(/\D/g,'');
+if(digits.length<10){$('walletInfo').innerHTML='<span class="text-rose-600 font-bold">Введите номер (10-11 цифр)</span>';$('payWalletBtn').disabled=true;return;}
+const r=await api('/api/wallet?phone='+digits);
+if(!r.found){$('walletInfo').innerHTML='<span class="text-rose-600">Не найдено</span>';$('payWalletBtn').disabled=true;curWallet=null;return;}
+curWallet=r;
+$('walletInfo').innerHTML='<b>'+r.name+'</b> · баланс: <b class="text-emerald-700">'+fmt(r.balance)+' ₽</b> · баллы: <b class="text-purple-700">'+r.bonus+' б</b> ('+r.level+')<br>+10 000 ₽/день · последнее пополнение: '+r.lastTopup;
+updateWalletBtn();}
+function updateWalletBtn(){const pay=curSession?curSession.pricing.payable:0;
+const ok=curWallet&&curWallet.balance>=pay-1e-9;
+$('payWalletBtn').disabled=!ok;
+$('payWalletBtn').textContent=ok?('Списать '+fmt(pay)+' ₽ с баланса телефона'):'Недостаточно средств на балансе телефона';}
+async function payWallet(){if(!curSession||!curWallet)return;
+const digits=($('walletPhone').value||'').replace(/\D/g,'');
+const res=await api('/api/wallet/pay',{method:'POST',body:JSON.stringify({sid:curSession.sid,phone:digits})});
+if(res.ok){stopPoll();closePayment();showReceipt(res.receipt);loadState();toast('✓ Оплата по номеру: списано '+fmt(res.receipt.total)+' ₽, остаток '+fmt(res.balance)+' ₽');}
+else if(res.error==='insufficient'){toast('Недостаточно средств на балансе телефона: '+fmt(res.balance)+' ₽');loadWallet();}
+else toast('Ошибка оплаты по номеру');}
+/* ---- ЧЕК ---- */
 function showReceipt(r){$('recStore').textContent=state.settings.storeName;$('recNum').textContent=r.num;$('recInn').textContent='ИНН: '+state.settings.inn+' | ККТ: 00049210492';$('recDateTime').textContent=r.dateTime;
 const list=$('recItemsList');list.innerHTML='';
 r.items.forEach(i=>{const d=document.createElement('div');d.className='flex justify-between text-[9px]';d.innerHTML='<span>'+i.name+' ('+i.qty+'x)</span><span class="font-bold">'+(i.price*i.qty).toFixed(2)+'</span>';list.appendChild(d);});
 if(r.discount>0)list.insertAdjacentHTML('beforeend','<div class="flex justify-between text-[9px] text-pink-600 font-bold"><span>СКИДКИ'+(r.promo?' ('+r.promo+')':'')+':</span><span>-'+fmt(r.discount)+' ₽</span></div>');
 if(r.write>0)list.insertAdjacentHTML('beforeend','<div class="flex justify-between text-[9px] text-purple-600 font-bold"><span>БОНУСАМИ:</span><span>-'+fmt(r.write)+' ₽</span></div>');
 if(r.accrual>0)list.insertAdjacentHTML('beforeend','<div class="flex justify-between text-[9px] text-emerald-600 font-bold"><span>НАЧИСЛЕНО:</span><span>+'+r.accrual+' б (баланс '+r.nb+')</span></div>');
-$('recTotal').textContent=(r.total<0?'-':'')+fmt(Math.abs(r.total))+' ₽';$('recVat').textContent=fmt(r.vat)+' ₽';$('recPayType').textContent=r.payType;$('recFiscal').textContent='ФД: '+r.fd+' | ФП: '+r.fp;
+$('recTotal').textContent=(r.total<0?'-':'')+fmt(Math.abs(r.total))+' ₽';$('recVat').textContent=fmt(r.vat)+' ₽';$('recPayType').textContent=r.payType+(r.walletPhone?' · '+r.walletPhone:'');$('recFiscal').textContent='ФД: '+r.fd+' | ФП: '+r.fp;
 $('recQrImg').src=qrUrl(r.code,300);show('receiptModal');}
+/* ---- СКЛАД ---- */
 function renderWarehouse(){const q=($('warehouseSearch').value||'').toLowerCase();const cat=$('warehouseCategoryFilter').value;
 const tb=$('warehouseTableBody');tb.innerHTML='';let tv=0;
 state.products.forEach(p=>{tv+=p.price*p.stock;if(cat!=='Все'&&p.category!==cat)return;if(q&&!p.name.toLowerCase().includes(q)&&!p.code.includes(q)&&!p.barcode.includes(q))return;
@@ -631,16 +755,18 @@ let code=$('apCode').value.trim();if(!code)code=String(Math.max.apply(null,state
 let barcode=$('apBarcode').value.trim();if(!barcode)barcode=String(Math.max.apply(null,state.products.map(p=>parseInt(p.barcode)||0))+1);
 await api('/api/product',{method:'POST',body:JSON.stringify({name:name,code:code,barcode:barcode,price:price,stock:parseInt($('apStock').value)||0,unit:$('apUnit').value,category:$('apCategory').value})});
 hide('addProductModal');loadState();toast('✓ Товар добавлен');}
+/* ---- КАТАЛОГ ---- */
 function openCatalog(){renderCatalog();show('catalogModal');}
 function renderCatalog(){const q=($('catalogModalSearch').value||'').toLowerCase();const g=$('catalogModalGrid');g.innerHTML='';
 state.products.filter(p=>p.name.toLowerCase().includes(q)||p.code.includes(q)).forEach(p=>{const c=document.createElement('div');c.className='p-2.5 bg-slate-50 border rounded-lg cursor-pointer hover:border-emerald-500';c.onclick=()=>{addItem(p.id);hide('catalogModal');};
 c.innerHTML='<div><span class="text-[9px] text-slate-400 font-mono-pos">Код: '+p.code+'</span><h5 class="font-bold text-xs">'+p.name+'</h5></div><div class="mt-2 flex justify-between text-xs font-mono-pos"><span class="text-emerald-700 font-bold">'+p.price.toFixed(2)+' ₽</span><span class="text-[10px] '+(p.stock>0?'bg-emerald-100 text-emerald-800':'bg-rose-100 text-rose-800')+' px-1.5 rounded font-semibold">'+(p.stock>0?'Ост:'+p.stock:'Нет')+'</span></div>';
 g.appendChild(c);});}
+/* ---- ОТЧЕТЫ ---- */
 function renderReports(){const s=state.stats;
 $('repTotalRevenue').textContent=fmt(s.revenue)+' ₽';$('repChecksCount').textContent=s.checks;
 $('repAvgCheck').textContent=fmt(s.checks?s.revenue/s.checks:0)+' ₽';$('repCashDrawer').textContent=fmt(s.drawer)+' ₽';
-$('repSberPayVal').textContent=fmt(s.sberPay)+' ₽';
-const t=s.revenue||1;$('repSberPayBar').style.width=(s.sberPay/t*100)+'%';
+$('repSberPayVal').textContent=fmt(s.sberPay)+' ₽';$('repWalletVal').textContent=fmt(s.wallet||0)+' ₽';
+const t=s.revenue||1;$('repSberPayBar').style.width=(s.sberPay/t*100)+'%';$('repWalletBar').style.width=((s.wallet||0)/t*100)+'%';
 $('repReturnsVal').textContent=s.returnsSum>0?'−'+fmt(s.returnsSum)+' ₽':'';
 const h=$('receiptsHistory');h.innerHTML=state.receipts.length?state.receipts.map(r=>'<div onclick=\'showReceipt(state.receipts.find(x=>x.num=="'+r.num+'"))\' class="flex gap-2 p-1.5 hover:bg-slate-50 rounded cursor-pointer border border-transparent hover:border-slate-200"><b class="font-mono-pos w-14">№'+r.num+'</b><span class="text-slate-500 flex-1">'+r.payType+(r.discount>0?' · скидка':'')+(r.accrual>0?' · +'+r.accrual+'б':'')+'</span><b class="font-mono-pos text-emerald-700">'+fmt(r.total)+' ₽</b></div>').join(''):'<i class="text-slate-400">Чеков пока нет</i>';
 const rl=$('returnsList');rl.innerHTML=state.returns.length?state.returns.map(r=>'<div class="flex gap-2 p-1.5 bg-rose-50/50 rounded border border-rose-100"><b class="font-mono-pos text-rose-700 w-14">'+r.num+'</b><span class="text-slate-600 flex-1 truncate">чек №'+r.orig+' · '+r.reason+'</span><b class="font-mono-pos text-rose-700">−'+fmt(r.sum)+' ₽</b></div>').join(''):'<i class="text-slate-400">Возвратов нет</i>';
@@ -658,6 +784,7 @@ const bp={};recs.forEach(r=>r.items.forEach(i=>{bp[i.name]=(bp[i.name]||0)+i.pri
 const top=Object.keys(bp).map(k=>[k,bp[k]]).sort((a,b)=>b[1]-a[1]).slice(0,5);
 if(!top.length){c2.fillStyle='#94a3b8';c2.fillText('Нет данных',8,60);}else{const mx=top[0][1]||1;const rh=(H2-40)/top.length;
 top.forEach((p,i)=>{const y=26+i*rh;const bw=(p[1]/mx)*(W2-230);c2.fillStyle='#0284c7';c2.fillRect(190,y+3,Math.max(4,bw),rh-10);c2.fillStyle='#334155';c2.font='9px monospace';c2.fillText(p[0].substring(0,24),6,y+rh/2+2);c2.fillStyle='#0c4a6e';c2.fillText(Math.round(p[1])+'₽',194+Math.max(4,bw),y+rh/2+2);});}}
+/* ---- ВОЗВРАТЫ ---- */
 function openReturnModal(){if(!state.receipts.length){toast('Нет чеков');return;}
 const s=$('retReceipt');s.innerHTML='';state.receipts.slice(0,30).forEach(r=>{const o=document.createElement('option');o.value=r.num;o.textContent='№'+r.num+' · '+r.dateTime+' · '+fmt(r.total)+' ₽';s.appendChild(o);});
 onRetChange();show('returnModal');}
@@ -702,6 +829,6 @@ if(window.innerWidth<1024)windowManager.toggleMaximize('posApp');};
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 80))
     print('=== Сбер POS (Amvera) ===')
-    print('Домен:      https://tel-charger7772585.amvera.io')
-    print('Порт:       ', port)
+    print('Домен: https://tel-charger7772585.amvera.io')
+    print('Порт:  ', port)
     app.run(host='0.0.0.0', port=port, debug=False)
